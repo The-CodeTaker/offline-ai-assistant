@@ -1,0 +1,23 @@
+# Core AI
+ollama>=0.1.8
+
+# Voice I/O
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.14          # Required backend for SpeechRecognition mic input
+piper-tts>=1.2.0         # Modern offline neural text-to-speech
+
+# Database
+# sqlite3 is part of the Python standard library — no install needed
+
+# Utilities
+python-dotenv>=1.0.0     # Optional: for .env-based config overrides
+loguru>=0.7.2            # Structured, human-friendly logging
+
+# Testing
+pytest>=8.0.0
+scikit-learn>=1.4.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+pymupdf>=1.23.0
+pytesseract>=0.3.10
+pillow>=10.0.0

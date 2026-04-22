@@ -1,0 +1,16 @@
+# Python
+venv/
+
+# AI models
+models/
+voice/models/
+voice/piper/
+
+# Runtime data
+data/
+*.db
+*.log
+
+# Cache
+__pycache__/
+*.pyc
