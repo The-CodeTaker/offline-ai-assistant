@@ -4,20 +4,25 @@ core/dialogue.py — Natural language response generation via a local Ollama mod
 The DialogueGenerator takes:
   - The user's original message
   - An IntentResult (from intent.py)
-  - Optional task_data: the result of a skill execution (DB rows, API response, etc.)
+  - Optional task_data: skill results, RAG context, or API responses
 
 And produces a warm, concise, conversational reply.
 
-Design decisions:
-  - A short system persona prompt keeps tone consistent without burning tokens.
-  - task_data is serialised to a compact JSON block and injected as context
-    so the model can reference real data rather than hallucinating answers.
-  - Streaming is supported via generate_stream() for a live-typing UX.
-  - Conversation history is accepted as an optional parameter so the model
-    can maintain short-term coherence across turns without a separate memory
-    module (just pass the last N turns from your DB).
-  - All Ollama errors are caught; a graceful fallback string is returned so
-    the calling loop never crashes on a model hiccup.
+System prompt design (this version)
+-------------------------------------
+  The previous prompt injected the current date/time prominently at the
+  top, which caused the LLM to regurgitate it in almost every response
+  ("As of today, Wednesday 22 April 2026 at 14:35…").
+
+  The new prompt:
+    1. Keeps date/time as a HIDDEN INTERNAL REFERENCE labelled
+       [INTERNAL — do not mention unless asked], so skills like reminders
+       can still format human-readable dates correctly.
+    2. Adds an explicit hard rule: NEVER volunteer the date or time in a
+       conversational reply unless the user specifically asks for it.
+    3. Elevates the priority of <task_data> — when RAG context is present
+       the LLM is explicitly told it MUST ground its answer in that context
+       and cite it as its source, not its own "general knowledge".
 """
 
 from __future__ import annotations
@@ -35,41 +40,55 @@ from core.intent import IntentResult
 
 
 # ---------------------------------------------------------------------------
-# Persona / system prompt
+# System prompt
 # ---------------------------------------------------------------------------
 
 def _build_system_prompt() -> str:
     """
-    Build the dialogue system prompt with the current date/time baked in.
-    Called fresh for every generate() call so the model always has an accurate
-    temporal anchor — critical for phrasing like "your reminder for tomorrow".
+    Build the dialogue system prompt with a hidden temporal anchor.
+
+    The date/time is injected so that SKILL replies (reminders, schedules)
+    can format dates correctly, but the model is explicitly instructed never
+    to surface it in general conversation.
     """
     now     = _dt.now()
-    today   = now.strftime("%Y-%m-%d")    # e.g. "2026-03-31"
-    weekday = now.strftime("%A")          # e.g. "Tuesday"
-    time_   = now.strftime("%H:%M")       # e.g. "14:35"
+    today   = now.strftime("%Y-%m-%d")
+    weekday = now.strftime("%A")
+    time_   = now.strftime("%H:%M")
 
     return f"""You are a helpful, friendly, and concise personal AI assistant \
-running entirely on the user's local device — no internet required.
+running entirely on the user's local device.
 
-CURRENT DATE & TIME (use when phrasing time-sensitive replies):
-  Today   : {today} ({weekday})
-  Time now: {time_}
+━━━ INTERNAL REFERENCE — DO NOT MENTION IN REPLIES ━━━
+Current date : {today} ({weekday})
+Current time : {time_}
+Use the above ONLY when a skill result references dates/times and you need
+to format them for the user (e.g. "your reminder is set for tomorrow, {weekday}").
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Your personality:
-- Warm and direct — never cold or robotic.
-- Concise — prefer 1–3 sentences unless more detail is clearly needed.
-- Honest — if you don't know something, say so plainly.
-- Never mention that you are an AI or a language model unless asked directly.
-- When referencing saved dates, always confirm with the human-readable form
-  (e.g. "Wednesday, 02 April 2026 at 15:00") so the user can verify.
+PERSONALITY RULES (always follow these):
+1. Be warm, direct, and concise — prefer 1–3 sentences unless detail is needed.
+2. NEVER open a reply by stating the current date, time, or day of the week.
+   Do not mention them at all unless the user has explicitly asked "what time is it?"
+   or "what day is it?" or a similarly direct temporal question.
+3. Never say "As of today…", "Currently…", "At the moment…" followed by a date.
+4. If you don't know something, say so plainly — do not fabricate.
+5. Never identify yourself as an AI or language model unless directly asked.
 
-When task data is provided between <task_data> tags, base your answer on that
-data. Do not invent facts that are not present in the task data.
-If the task data is empty or absent, answer from your own knowledge conversationally.
+TASK DATA RULES (highest priority when <task_data> is present):
+6. When a <task_data> block is provided, you MUST base your answer
+   primarily on the information inside it.
+7. If <task_data> contains a "retrieved_context" field, treat it as the
+   authoritative source for the user's question. Answer directly from it.
+   Do not contradict or ignore it. You may say "Based on the document…"
+   to signal you are using it.
+8. If <task_data> is absent or empty, answer conversationally from your
+   own knowledge.
+9. Do NOT invent facts that are not present in <task_data>.
 """
 
-# Template for injecting structured skill results into the user turn
+
+# Template for injecting structured skill / RAG results into the user turn
 _TASK_DATA_TEMPLATE = """<task_data>
 {task_json}
 </task_data>
@@ -78,52 +97,39 @@ User message: {user_message}"""
 
 
 # ---------------------------------------------------------------------------
-# Dialogue generator
+# DialogueGenerator
 # ---------------------------------------------------------------------------
 
 class DialogueGenerator:
     """
     Generates a natural conversational response given a user message,
-    the classified intent, and optional executed-task data.
+    the classified intent, and optional executed-task / RAG data.
 
-    Basic usage:
+    Usage:
         gen = DialogueGenerator()
-
-        # After a skill has run and returned data:
         reply = gen.generate(
-            user_message="Remind me to call Alice at 3pm",
+            user_message="What does the contract say about payment?",
             intent_result=intent_result,
-            task_data={"status": "created", "reminder_id": 7}
+            task_data={"retrieved_context": "...relevant PDF excerpt..."}
         )
 
-    Streaming usage (for a typing effect in the UI):
-        for chunk in gen.generate_stream(user_message, intent_result):
+    Streaming:
+        for chunk in gen.generate_stream(user_message, intent_result, task_data):
             print(chunk, end="", flush=True)
     """
 
     def __init__(
         self,
-        model: str = config.MODEL_NAME,
-        temperature: float = 0.7,
-        max_tokens: int = 512,
-        history_window: int = 6,
+        model:          str   = config.MODEL_NAME,
+        temperature:    float = 0.7,
+        max_tokens:     int   = 512,
+        history_window: int   = 6,
     ) -> None:
-        """
-        Args:
-            model         : Ollama model identifier (from config).
-            temperature   : Sampling temperature — 0.7 balances creativity/focus.
-            max_tokens    : Hard cap on response length.
-            history_window: Max number of previous (user + assistant) turns to
-                            include for context continuity.
-        """
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.model          = model
+        self.temperature    = temperature
+        self.max_tokens     = max_tokens
         self.history_window = history_window
-        logger.debug(
-            f"DialogueGenerator ready "
-            f"(model={self.model}, temp={self.temperature})"
-        )
+        logger.debug(f"DialogueGenerator ready (model={self.model}, temp={self.temperature})")
 
     # ------------------------------------------------------------------
     # Public API — blocking
@@ -131,33 +137,27 @@ class DialogueGenerator:
 
     def generate(
         self,
-        user_message: str,
-        intent_result: IntentResult | None = None,
-        task_data: Any = None,
-        history: list[dict[str, str]] | None = None,
+        user_message:  str,
+        intent_result: IntentResult | None          = None,
+        task_data:     Any                          = None,
+        history:       list[dict[str, str]] | None  = None,
     ) -> str:
         """
         Generate and return the full response as a string.
 
         Args:
             user_message : The raw text the user typed/spoke.
-            intent_result: Classified intent (used for optional meta context).
-            task_data    : Structured data from skill execution. Can be a dict,
-                           list, string, or None. Serialised to JSON if needed.
-            history      : List of previous turns as {"role": ..., "content": ...}
-                           dicts. Pass the last N turns from your conversations DB.
-        Returns:
-            A natural language string ready to be spoken or displayed.
+            intent_result: Classified intent.
+            task_data    : Skill result or RAG context dict. Serialised to
+                           JSON and injected inside <task_data> tags.
+            history      : Previous turns as {"role": ..., "content": ...}.
         """
         messages = self._build_messages(user_message, intent_result, task_data, history)
 
         try:
             response = ollama.chat(
                 model=self.model,
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": self.max_tokens,
-                },
+                options={"temperature": self.temperature, "num_predict": self.max_tokens},
                 messages=messages,
             )
             reply = response.message.content.strip()
@@ -177,31 +177,23 @@ class DialogueGenerator:
 
     def generate_stream(
         self,
-        user_message: str,
-        intent_result: IntentResult | None = None,
-        task_data: Any = None,
-        history: list[dict[str, str]] | None = None,
+        user_message:  str,
+        intent_result: IntentResult | None          = None,
+        task_data:     Any                          = None,
+        history:       list[dict[str, str]] | None  = None,
     ) -> Generator[str, None, None]:
         """
         Stream the response token-by-token.
 
-        Yields string chunks as they arrive from Ollama.
-        Example usage in main loop:
-            for chunk in gen.generate_stream(user_input, result):
-                print(chunk, end="", flush=True)
-            print()  # final newline
-
-        Falls back to yielding the full string from generate() on error.
+        Yields str chunks as they arrive; falls back to a full generate()
+        call if streaming fails.
         """
         messages = self._build_messages(user_message, intent_result, task_data, history)
 
         try:
             stream = ollama.chat(
                 model=self.model,
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": self.max_tokens,
-                },
+                options={"temperature": self.temperature, "num_predict": self.max_tokens},
                 messages=messages,
                 stream=True,
             )
@@ -223,25 +215,23 @@ class DialogueGenerator:
 
     def _build_messages(
         self,
-        user_message: str,
+        user_message:  str,
         intent_result: IntentResult | None,
-        task_data: Any,
-        history: list[dict[str, str]] | None,
+        task_data:     Any,
+        history:       list[dict[str, str]] | None,
     ) -> list[dict[str, str]]:
         """
-        Assemble the full messages list to send to Ollama:
-          [system] + [history (windowed)] + [user turn (with optional task data)]
+        Assemble the full messages list:
+          [system] + [history (windowed)] + [user turn w/ optional task_data]
         """
         messages: list[dict[str, str]] = [
             {"role": "system", "content": _build_system_prompt()},
         ]
 
-        # Inject windowed conversation history for coherence
         if history:
-            windowed = history[-(self.history_window * 2):]  # 2 messages per turn
+            windowed = history[-(self.history_window * 2):]
             messages.extend(windowed)
 
-        # Build the user turn — inject task_data if present
         user_content = self._build_user_content(user_message, intent_result, task_data)
         messages.append({"role": "user", "content": user_content})
 
@@ -250,18 +240,17 @@ class DialogueGenerator:
 
     @staticmethod
     def _build_user_content(
-        user_message: str,
+        user_message:  str,
         intent_result: IntentResult | None,
-        task_data: Any,
+        task_data:     Any,
     ) -> str:
         """
-        If task_data exists, wrap it in a <task_data> block so the model
-        can ground its response in real results rather than hallucinating.
+        If task_data exists, wrap it in a <task_data> block.
+        The block may contain RAG retrieved_context, skill results, or both.
         """
         if task_data is None:
             return user_message
 
-        # Serialise task_data gracefully
         if isinstance(task_data, str):
             task_json = task_data
         else:
